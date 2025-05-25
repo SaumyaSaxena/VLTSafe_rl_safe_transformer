@@ -1,0 +1,21 @@
+tag: ${now:%Y-%m-%d-%H-%M-%S}
+debug: True # always true since we are not using wandb during eval
+prefix: 'eval'
+
+eval_cfg:
+  gpu: 1
+  seed: 0
+  wandb_load:
+    project: safety_rl_manip
+    run_path: iam-lab/safety_rl_manip/8oc8cvgn
+    file: model/step_4743999_test_return_-9699.91_succRate_0.95.pth
+  eval_value_fn: False
+  eval_safe_rollouts: True
+  save_rollout_gifs: True
+  num_visualization_rollouts: 20
+  num_eval_episodes: 200
+
+# remove below if using the same env as during training
+env_cfg:
+  doneType: 'real'
+  img_size: [256, 256]

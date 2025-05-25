@@ -1,0 +1,226 @@
+debug: False
+gpu: 1
+seed: 20
+tag: ${now:%Y-%m-%d-%H-%M-%S}
+run_name: "train_DDPG_SA_indep_${train_cfg.mode}" 
+variant: 'MultiConst_MultiGoal'
+
+hydra:
+  run:
+    dir: outputs/train/${run_name}/${tag}_${variant}
+  job:
+    chdir: True
+
+defaults:
+  - /envs: mujoco_envs.yaml
+  - _self_
+
+wandb:
+  entity: iam-lab
+  group: drabe/DDPG
+  project: safety_rl_manip
+  name: ${run_name}_${variant}
+wandb_resume_id: null
+
+env_name: "slide_pickup_clutter_mujoco_multimodal_env-v0"
+envs:
+  slide_pickup_clutter_mujoco_multimodal_env-v0:
+    doneType: 'all'
+    return_type: 'reward'
+    mode: ${train_cfg.mode}
+    costType: 'max_ell_g'
+    epochs: ${train_cfg.epochs}
+    constraint_type_repr: 'int'
+    shape_reward: False
+    scaling_target: 1000.0
+    scaling_safety: 1000.0
+    reset_grasped: True
+    normalize_pos: False
+    less_crowded: False
+    reset_uncrowded: False
+    multi_goal: True
+    n_rel_objs: 6
+    tok_k_mask: 3
+    objects:
+      names: ['porcelain_mug', 'blue_mug', 'red_mug', 'toy_sheep', 'supplement0', 'supplement2'] # 'porcelain_mug', 'blue_mug', 'red_mug', 'toy_sheep', 'supplement0', 'supplement2'
+    constraint_types: ['no_contact', 'soft_contact', 'any_contact', 'no_over'] # , 'soft_contact', 'any_contact', 'no_over'; used when randomize_constraint_types=True
+    randomize_constraint_types: True
+    obj_to_constraint_map: # used when randomize_constraint_types=False
+      porcelain_mug: 'no_contact'
+      blue_mug: 'no_contact'
+      red_mug: 'soft_contact'
+      toy_sheep: 'soft_contact'
+      supplement0: 'no_over'
+      supplement2: 'any_contact'
+    observations:
+      low_dim: ['robot_state', 'objects_state', 'objects_mask'] # , 'objects_mask', 'objects_semantics'
+      rgb: [] # ['rgb_front_cam','rgb_eye_in_hand_cam']
+      append_stack_to_robot_state: False
+
+train_cfg:
+  run_variant: ${variant}
+  algo_name: DDPG
+  mode: 'RA' # RA, lagrange
+  seed: ${seed}
+  steps_per_epoch: 4000 # 4000
+  epochs: 1200
+  replay_size: 1e+6
+  gamma: 0.99
+  schedule_gamma: False
+  gamma_warmup_epochs: 150
+  scale_q_loss: 1000.0
+  polyak: 0.995
+  optimizer:
+    pi_lr: 1.0e-4
+    q_lr: 1.0e-4
+    clip_grad_norm: 5.0
+    AdamW:
+      eps: 1.0e-8
+      weight_decay: 0.01
+    pi_scheduler:
+      sched: cosine
+      # epochs are updated in code: epochs <- total_epochs - warmup - cooldown
+      epochs: ${train_cfg.epochs}  # Total epochs to run (warmup + decay + cooldown)
+      min_lr: 1.0e-5
+      warmup_lr: 5.0e-4
+      warmup_epochs: 10
+      cooldown_epochs: 0
+      warmup_restarts: False
+      T_0: 10
+      T_mult: 2
+    q_scheduler:
+      sched: cosine
+      # epochs are updated in code: epochs <- total_epochs - warmup - cooldown
+      epochs: ${train_cfg.epochs}  # Total epochs to run (warmup + decay + cooldown)
+      min_lr: 1.0e-5
+      warmup_lr: 5.0e-4
+      warmup_epochs: 10
+      cooldown_epochs: 0
+      warmup_restarts: False
+      T_0: 10
+      T_mult: 2
+  batch_size: 200 # 200
+  start_steps: 10000 # 10000
+  update_after: 1000 # 1000
+  update_steps: 50 # 50
+  update_every: 50 # 50
+  act_noise: 0.1
+  schedule_noise: False
+  noise_decay: 0.985
+  max_ep_len: 300 # check
+  model_save_freq: 2
+  plot_save_freq: 10
+  save_top_k: 10
+  ac_type: TransformerIndepActorCritic # 'MLPActorCritic', 'TransformerIndepActorCritic'
+  ac_kwargs:
+    TransformerIndepActorCritic:
+      token_embedding_size: 128
+      pred_horizon: 1
+      window_size: 1
+      q_action_condn_type: 'early_late' # 'early', 'late', 'early_late' # action tokenizer is used only if this is 'early'
+      position_embedding_type: 'None' # 'sinusoidal', 'parameter', 'embedding', None
+      observation_tokenizers:
+        image_primary:
+          kwargs:
+            encoder: 
+              name: SmallStem16
+              kwargs:
+                trainable: False
+            obs_stack_keys: []
+            num_tokens: 256
+          name: ImageTokenizer
+        image_secondary:
+          kwargs:
+            encoder: 
+              name: SmallStem16
+              kwargs:
+                trainable: False
+            obs_stack_keys: []
+            num_tokens: 256
+          name: ImageTokenizer
+        low_dim_primary:
+          kwargs:
+            obs_stack_keys: ['robot_state'] # all keys should have same shape
+            hidden_sizes: [64,64]
+          name: LowdimObsTokenizer
+        low_dim_secondary:
+          kwargs:
+            obs_stack_keys: ['objects_state'] # all keys should have same shape
+            hidden_sizes: [64,64]
+          name: LowdimObsTokenizer
+      action_tokenizers:
+        low_dim_action:
+          kwargs:
+            obs_stack_keys: ['action'] # all keys should have same shape
+            hidden_sizes: [64,64]
+          name: LowdimObsTokenizer
+      semantic_tokenizers:
+        low_dim_sem0:
+          kwargs:
+            obs_stack_keys: [] # 'objects_semantics', all keys should have same shape
+            hidden_sizes: [64,64]
+          name: LowdimObsTokenizer
+      readouts_actor:
+        action: 1
+      readouts_critic:
+        value: 1
+      heads:
+        action:
+          args: []
+          kwargs:
+            pred_horizon: ${train_cfg.ac_kwargs.TransformerIndepActorCritic.pred_horizon}
+            readout_key: readout_action # is always "readout_{head_name}" where here head_name = action
+            hidden_sizes: [64,64]
+            use_map: false
+            embedding_size: ${train_cfg.ac_kwargs.TransformerIndepActorCritic.token_embedding_size}
+            loss_type: 'mse' # 'l1', 'softmax_cross_ent', 'mse'
+          name: ContinuousActionHead
+        value:
+          args: []
+          kwargs:
+            pred_horizon: ${train_cfg.ac_kwargs.TransformerIndepActorCritic.pred_horizon}
+            readout_key: readout_value # is always "readout_{head_name}" where here head_name = value
+            hidden_sizes: [64,64]
+            use_map: false
+            loss_type: 'mse' # 'l1', 'softmax_cross_ent', 'mse'
+          name: ValueHead
+      Q_transformer_kwargs:
+        add_position_embedding: False
+        transformer_output_type: 'mean' # 'mean', 'cls'
+        attention_dropout_rate: 0.0
+        dropout_rate: 0.0
+        mlp_dim: 256 # around 4 times the token_embedding_size
+        num_attention_heads: 4 #6
+        num_layers: 2 #12
+        window_size: ${train_cfg.ac_kwargs.TransformerIndepActorCritic.window_size}
+        token_embedding_size: ${train_cfg.ac_kwargs.TransformerIndepActorCritic.token_embedding_size}
+        attention_type: 'SA' # SA, CA, AdaLN
+      pi_transformer_kwargs:
+        add_position_embedding: False
+        transformer_output_type: 'mean' # 'mean', 'cls'
+        attention_dropout_rate: 0.0
+        dropout_rate: 0.0
+        mlp_dim: 256 # around 4 times the token_embedding_size
+        num_attention_heads: 4 #6
+        num_layers: 2 #12
+        window_size: ${train_cfg.ac_kwargs.TransformerIndepActorCritic.window_size}
+        token_embedding_size: ${train_cfg.ac_kwargs.TransformerIndepActorCritic.token_embedding_size}
+        attention_type: 'SA' # SA, CA, AdaLN
+    MLPActorCritic:
+      hidden_sizes: [256,256]
+      activation: 'relu'
+  resume_from_ckpt: False
+  wandb_load:
+    run_path: iam-lab/safety_rl_manip/31edd9u7 # 6objs, RA
+    file: model/step_135999_test_return_-566.38_succRate_0.26.pth
+
+eval_cfg:
+  seed: ${seed}
+  async_eval: False # check
+  eval_value_fn: False
+  test_value_fn: False
+  num_test_episodes: 80
+  eval_safe_rollouts: True
+  num_eval_episodes: 5000
+  save_rollout_gifs: True
+  num_visualization_rollouts: 20

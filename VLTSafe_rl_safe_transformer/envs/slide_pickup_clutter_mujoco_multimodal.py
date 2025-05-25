@@ -1,0 +1,1484 @@
+import warnings
+import os
+
+import numpy as np
+import random
+import gym
+import copy
+import matplotlib.pyplot as plt
+import wandb
+
+from scipy.spatial.transform import Rotation
+from scipy.ndimage import median_filter
+import mujoco
+
+from robosuite.models import MujocoWorldBase
+from robosuite.models.arenas import MultiTaskNoWallsArena
+from robosuite.models.objects.primitive.box import BoxObject
+from robosuite.models.objects import MujocoXMLObject
+from robosuite.models.objects.utils import get_obj_from_name
+from robosuite.utils.placement_samplers import UniformRandomSampler, SequentialCompositeSampler
+from robosuite.models.robots import Panda
+from robosuite.models.grippers import gripper_factory
+from robosuite.utils.mjcf_utils import recolor_collision_geoms, new_site, string_to_array
+from robosuite.utils.binding_utils import MjSim
+
+from VLTSafe_rl_safe_transformer.envs.utils import signed_dist_fn_rectangle
+from .base_env import BaseMujocoEnv
+
+class SlidePickupClutterMujocoMultimodalEnv(BaseMujocoEnv):
+    def __init__(self, device, cfg):
+        super().__init__(device, cfg)
+        
+        self.n_rel_objs = self.env_cfg.n_rel_objs
+        self.frame_skip = self.env_cfg.frame_skip
+        self._did_see_sim_exception = False
+        self.goal = np.array(self.env_cfg.goal)
+        self.observations = self.env_cfg.observations
+        self.constraint_type_repr = self.env_cfg.get('constraint_type_repr', 'int')
+        self.append_stack_to_robot_state = self.env_cfg.observations.get('append_stack_to_robot_state', False)
+        self.normalize_pos = self.env_cfg.get('normalize_pos', False)
+        self.multi_goal = self.env_cfg.get('multi_goal', False)
+        self.less_crowded = self.env_cfg.get('less_crowded', False)
+        self.randomize_constraint_types = self.env_cfg.get('randomize_constraint_types', True)
+
+        self.all_blocks_object_names = [self.env_cfg.block_bottom.block_name, self.env_cfg.block_top.block_name] + self.env_cfg.objects.names
+
+        self.N_all_objects = len(self.all_blocks_object_names)
+        self.N_dist_objects = len(self.env_cfg.objects.names)
+
+        self.use_constraint_types = self.env_cfg.use_constraint_types
+
+        self.object_type_to_int_mapping = {
+            f'ee': 0,
+            f'{self.env_cfg.block_bottom.block_name}': 1,
+            f'{self.env_cfg.block_top.block_name}': 2
+        }
+        self.constraint_to_int_mapping = {
+            'any_contact': 3,
+            'soft_contact': 4,
+            'no_contact': 5,
+            'no_over': 6,
+        }
+        self.max_constraint_types = 7
+    
+        if self.use_constraint_types:
+            if self.constraint_type_repr == 'int':
+                self.low_dim_sizes = {'robot0': 7, 'objects': 7, 'semantics': 1}
+            elif self.constraint_type_repr == 'one_hot':
+                self.low_dim_sizes = {'robot0': 6+self.max_constraint_types, 'objects': 6+self.max_constraint_types, 'semantics': self.max_constraint_types}
+        else:
+            self.low_dim_sizes = {'robot0': 6, 'objects': 6}
+
+        if self.multi_goal:
+            self.target_set_to_int_mapping = {t_name: t for t, t_name in enumerate(list(self.env_cfg.block_bottom.multi_goal_target_sets.keys()))}
+            self.low_dim_sizes['robot0'] += 1
+            self.low_dim_sizes['objects'] += 1
+            self.low_dim_sizes['semantics'] += 1
+
+        self.low_dim_sizes['full_size'] = self.low_dim_sizes['robot0'] + (2+self.n_rel_objs)*self.low_dim_sizes['objects']
+
+        self.set_observation_shapes()
+
+        self.obj_to_constraint_map = self.env_cfg.obj_to_constraint_map
+        self.obj_to_constraint_map_gt = copy.deepcopy(self.obj_to_constraint_map)
+
+        assert self.N_dist_objects <= len(self.env_cfg.objects.initial_poses), f"Number of initial poses {len(self.env_cfg.objects.initial_poses)} less than number of object names {self.N_dist_objects}"
+        assert self.env_cfg.n_rel_objs <= len(self.env_cfg.objects.names)
+        
+        self.u_min = np.array(self.env_cfg.control_low)
+        self.u_max = np.array(self.env_cfg.control_high)
+        self.action_space = gym.spaces.Box(self.u_min, self.u_max)
+
+        self.env_bound_low = np.array(self.env_cfg.env_bounds.low)
+        self.env_bound_high = np.array(self.env_cfg.env_bounds.high)
+
+        # self.observation_space = gym.spaces.Box(
+        #     self.env_bound_low,
+        #     self.env_bound_high
+        # )
+
+        self.observation_space = gym.spaces.Box(
+            -np.inf*np.ones(self.low_dim_sizes['full_size']),
+            np.inf*np.ones(self.low_dim_sizes['full_size'])
+        )
+
+        self._setup_procedural_env()
+
+        self.model.vis.global_.offheight = self.env_cfg.img_size[0]
+        self.model.vis.global_.offwidth = self.env_cfg.img_size[1]
+
+        self.renderer = mujoco.Renderer(self.model, height=self.env_cfg.img_size[0], width=self.env_cfg.img_size[1])
+
+        self.initialize_procedural_sampler()
+        self.reset_mocap_welds()
+
+        self.all_body_ids = list(range(self.model.nbody))
+        self.all_body_names = [mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_BODY, i) for i in self.all_body_ids]
+        
+        self.all_geom_ids = list(range(self.model.ngeom))
+        self.all_geom_names=[mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_GEOM, i) for i in self.all_geom_ids]
+
+        self.side_cam_name = "side_cap"
+        self.front_cam_name = "front_cap3"
+        self.eye_in_hand_cam_name = "robot0_eye_in_hand"
+        
+        self.reset()
+
+        self.side_camera_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_CAMERA, self.side_cam_name)
+        self.front_camera_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_CAMERA, self.front_cam_name)
+        self.eye_in_hand_camera_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_CAMERA, self.eye_in_hand_cam_name)
+        
+        self.side_cam_pos, self.side_cam_quat_wxyz = self.get_static_cam_pose(self.side_camera_id)
+        self.front_cam_pos, self.front_cam_quat_wxyz = self.get_static_cam_pose(self.front_camera_id)
+        self.eye_in_hand_cam_pos, self.eye_in_hand_cam_quat_wxyz = self.get_static_cam_pose(self.eye_in_hand_camera_id)
+
+        # Camera info
+        height, width = self.renderer._height, self.renderer._width
+        fx = width / (2.0 * np.tan(float(self.model.cam_fovy[self.front_camera_id]) * np.pi / 360.0))
+        fy = height / (2.0 * np.tan(float(self.model.cam_fovy[self.front_camera_id]) * np.pi / 360.0))
+        cx, cy = width / 2.0, height / 2.0
+        K = np.array([[fx, 0, cx],[0, fy, cy],[0, 0, 1]])
+        self.camera_info = {
+            "fx": float(fx),
+            "fy": float(fy),
+            "cx": float(cx),
+            "cy": float(cy),
+            "width": int(width),
+            "height": int(height),
+            "K": K,
+            "front_cam_pos": self.front_cam_pos,
+            "front_cam_quat_wxyz": self.front_cam_quat_wxyz,
+        }
+        # Will visualize the value function in x-y only for initial positions of bottom block
+        self.N_x = self.env_cfg.block_bottom.N_x
+
+        self.visual_initial_states = None
+        self.all_failure_modes = ['top_block_oob', 'collision_no_contact', 'collision_soft_contact', 'collision_no_over', 'out_of_env', 'success']
+    
+    @property
+    def tcp_center(self):
+        """The COM of the gripper's 2 fingers
+
+        Returns:
+            (np.ndarray): 3-element position
+        """
+        right_finger_pos = self._get_site_pos('robot0_rightfinger')
+        left_finger_pos = self._get_site_pos('robot0_leftfinger')
+        tcp_center = (right_finger_pos + left_finger_pos) / 2.0
+        return tcp_center
+    
+    @property
+    def env_observation_shapes(self):
+        return self.observation_shapes
+
+    @property
+    def ee_pos(self):
+        # body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, 'gripper0_mocap')
+        body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, 'gripper0_eef')
+        return self.data.xpos[body_id]
+    
+    @property
+    def top_block_pos(self):
+        # self.data.subtree_com[body_id]
+        return self._get_body_pos(self.env_cfg.block_top.block_name)
+
+    @property
+    def bottom_block_pos(self):
+        return self._get_body_pos(self.env_cfg.block_bottom.block_name)
+
+    @property
+    def current_timestep(self):
+        return self._current_timestep
+
+    @property
+    def dt(self):
+        return self.model.opt.timestep * self.frame_skip
+    
+    def set_observation_shapes(self):
+        # TODO(saumya): this function needs to be fixed so that observation shapes correspond to relevant objects not all objects in the env
+        self.observation_shapes = {}
+        if self.append_stack_to_robot_state:
+            self.observation_shapes['robot_state'] = (self.low_dim_sizes['robot0']+2*self.low_dim_sizes['objects'],)
+            if 'objects_state' in self.observations['low_dim']:
+                self.observation_shapes['objects_state'] = (self.N_dist_objects, self.low_dim_sizes['objects'])
+            if 'objects_semantics' in self.observations['low_dim']:
+                self.observation_shapes['objects_semantics'] = (self.N_dist_objects+1, self.low_dim_sizes['semantics'])
+            if 'objects_mask' in self.observations['low_dim']:
+                self.observation_shapes['objects_mask'] = (self.N_dist_objects+1, self.N_dist_objects+1)
+        else:
+            self.observation_shapes['robot_state'] = (self.low_dim_sizes['robot0'],)
+            if 'objects_state' in self.observations['low_dim']:
+                self.observation_shapes['objects_state'] = (self.N_all_objects, self.low_dim_sizes['objects'])
+            if 'objects_semantics' in self.observations['low_dim']:
+                self.observation_shapes['objects_semantics'] = (self.N_all_objects+1, self.low_dim_sizes['semantics'])
+            if 'objects_mask' in self.observations['low_dim']:
+                self.observation_shapes['objects_mask'] = (self.N_all_objects+1, self.N_all_objects+1)
+
+        for k in self.observations['rgb']:
+            self.observation_shapes[k] = (self.env_cfg.img_size[0], self.env_cfg.img_size[1], 3)
+
+    def update_relevant_objs(self, objs=None):
+        if objs is None: # Training (Run on reset): randomly sample n_rel_objs from all objects
+            self.rel_obj_names = random.sample(self.env_cfg.objects.names, len(self.env_cfg.objects.names))[:self.env_cfg.n_rel_objs]
+        else: # Eval
+            if not (set(self.rel_obj_names) == set(objs)): # do not update if the unique elements are the same
+                self.rel_obj_names = [o for o in objs]
+                    
+    def update_constraint_types(self, const_types=None):
+        if const_types is None: # Training: pred constraint types and GT constraint types are the same
+            if self.randomize_constraint_types:
+                self.pred_constraint_types = {obj_name: random.choice(self.env_cfg.constraint_types) for obj_name in self.env_cfg.objects.names}
+            else:
+                self.pred_constraint_types = copy.deepcopy(self.obj_to_constraint_map_gt)
+            self.obj_to_constraint_map = copy.deepcopy(self.pred_constraint_types) # used for safety analysis
+        else: # Eval: Use GT constraint types specified by user
+            self.pred_constraint_types = const_types
+            self.obj_to_constraint_map = copy.deepcopy(self.obj_to_constraint_map_gt) # used for safety analysis
+    
+    def update_goal(self, target_set=None):
+        if target_set is None:
+            if self.multi_goal:
+                self.target_set_name = random.choice(list(self.env_cfg.block_bottom.multi_goal_target_sets.keys()))
+                self.sampled_target_set_low = np.array(self.env_cfg.block_bottom.multi_goal_target_sets[self.target_set_name].low)
+                self.sampled_target_set_high = np.array(self.env_cfg.block_bottom.multi_goal_target_sets[self.target_set_name].high)
+            else:
+                self.target_set_name = 'target_set'
+                self.sampled_target_set_low = np.array(self.env_cfg.block_bottom.target_set.low)
+                self.sampled_target_set_high = np.array(self.env_cfg.block_bottom.target_set.high)
+        else:
+            self.sampled_target_set_low = np.array(target_set.low)
+            self.sampled_target_set_high = np.array(target_set.high)
+
+        
+    def _get_site_pos(self, siteName):
+        sid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SITE, siteName)
+        return self.data.site_xpos[sid]
+    
+    def _get_body_pos(self, bodyName):
+        body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, f'{bodyName}_main')
+        return self.data.xpos[body_id]
+    
+    def _get_body_vel(self, bodyName):
+        body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, f'{bodyName}_main')
+        dof_addr = self.model.body_dofadr[body_id]  # Degree of freedom address
+        velocity = self.data.qvel[dof_addr:dof_addr+self.model.body_dofnum[body_id]]
+        return velocity[:3] # linear velocity
+    
+    def get_static_cam_pose(self, cam_id):
+        cam_pos = self.data.cam_xpos[cam_id]
+        cam_rot = self.data.cam_xmat[cam_id].reshape(3,3) # camera points along -z-axis
+        rotation_z = Rotation.from_euler('z', 180, degrees=True).as_matrix()
+        rotation_y = Rotation.from_euler('y', 180, degrees=True).as_matrix()
+        new_rotation_matrix =  cam_rot @ rotation_z @ rotation_y # converts camera to point in +z axis
+
+        q_wxyz = Rotation.from_matrix(new_rotation_matrix).as_quat(scalar_first=True)
+        return cam_pos, q_wxyz
+    
+    def get_current_image(self, cam_name):
+        self.renderer.update_scene(self.data, camera=cam_name)
+        return self.renderer.render()
+
+    def get_current_segmentation_mask(self, cam_name):
+        self.renderer.enable_segmentation_rendering()
+        self.renderer.update_scene(self.data, camera=cam_name)
+        seg_img = self.renderer.render()
+        self.renderer.disable_segmentation_rendering()
+
+        seg_geoms = seg_img[:,:,0]
+        seg_geoms[seg_geoms==-1] = 0
+        smoothed_seg_geoms = median_filter(seg_geoms, size=3)
+        seg_body_id = self.model.geom_bodyid[smoothed_seg_geoms]
+        return seg_body_id
+    
+    def _setup_procedural_env(self):
+        world = MujocoWorldBase()
+        mujoco_arena = MultiTaskNoWallsArena()
+        world.merge(mujoco_arena)
+
+        self.mujoco_robot = Panda()
+        self.gripper = gripper_factory('PandaGripper')
+        self.mujoco_robot.set_base_xpos(self.env_cfg.robot_base_pos)
+        self.mujoco_robot.add_gripper(self.gripper)
+        recolor_collision_geoms(root=self.mujoco_robot.worldbody, rgba=[0, 0, 0., 0.])
+        world.merge(self.mujoco_robot)
+
+        self.all_mujoco_objects = {}
+        # Bottom block
+        if 'block' in self.env_cfg.block_bottom.block_name:
+            block_bottom = BoxObject(name='block_bottom', size=self.env_cfg.block_bottom.size, rgba=self.env_cfg.block_bottom.rgba)
+            self.bottom_hor_rad = np.array(block_bottom.size)
+        else:
+            block_bottom = get_obj_from_name(self.env_cfg.block_bottom.block_name)
+            hor_site = block_bottom.worldbody.find(f"./body/site[@name='{self.env_cfg.block_bottom.block_name}_horizontal_radius_site']")
+            self.bottom_hor_rad = string_to_array(hor_site.get("pos"))
+        block_bottom_body = block_bottom.get_obj()
+        self.block_bottom_z = -block_bottom.bottom_offset[2]
+        block_bottom_body.set('pos', f'{self.env_cfg.block_bottom.initial_pos[0]} {self.env_cfg.block_bottom.initial_pos[1]} {self.block_bottom_z}')
+        world.worldbody.append(block_bottom_body)
+        world.merge_assets(block_bottom)
+        self.all_mujoco_objects[self.env_cfg.block_bottom.block_name] = block_bottom
+        
+        if 'lego' in self.env_cfg.block_bottom.block_name:
+            rot_z = Rotation.from_euler('z', -90, degrees=True)  # 90 degrees about Z-axis
+            rot_x = Rotation.from_euler('x', -90, degrees=True)  # 90 degrees about X-axis
+            relquat = (rot_x*rot_z).as_quat(scalar_first=True)
+            suction_site = new_site(
+                name=f"suction_site", 
+                pos=(-self.bottom_hor_rad[0]+0.025, -self.block_bottom_z+0.01, 0), 
+                quat=relquat,
+                size=(0.01, 0.01, 0.01), 
+                rgba=(1, 0, 0, 1)
+            )
+        else:
+            rot_z = Rotation.from_euler('z', 0, degrees=True)  # 90 degrees about Z-axis
+            rot_x = Rotation.from_euler('x', -90, degrees=True)  # 90 degrees about X-axis
+            relquat = (rot_x*rot_z).as_quat(scalar_first=True)
+            suction_site = new_site(
+                name=f"suction_site", 
+                pos=(0, -self.block_bottom_z+0.01, self.bottom_hor_rad[0]-0.025), 
+                quat=relquat,
+                size=(0.01, 0.01, 0.01), 
+                rgba=(1, 0, 0, 1)
+            )
+        block_bottom_body.append(suction_site)
+        
+        # Top block
+        if 'block' in self.env_cfg.block_top.block_name:
+            block_top = BoxObject(name='block_top', size=self.env_cfg.block_top.size, rgba=self.env_cfg.block_top.rgba)
+        else:
+            block_top = get_obj_from_name(self.env_cfg.block_top.block_name)
+        block_top_body = block_top.get_obj()
+        self.block_top_z = (block_bottom.top_offset - block_bottom.bottom_offset - block_top.bottom_offset)[2]
+        block_top_body.set('pos', f'{self.env_cfg.block_top.initial_pos[0]} {self.env_cfg.block_top.initial_pos[1]} {self.block_top_z}')
+        world.worldbody.append(block_top_body)
+        world.merge_assets(block_top)
+        self.all_mujoco_objects[self.env_cfg.block_top.block_name] = block_top
+
+        self.object_bottom_z = []
+        for obj_name, obj_pos in zip(self.env_cfg.objects.names, self.env_cfg.objects.initial_poses):
+            obj = get_obj_from_name(obj_name)
+            obj_body = obj.get_obj()
+            self.object_bottom_z.append(-obj.bottom_offset[2])
+            obj_body.set('pos', f'{obj_pos[0]} {obj_pos[1]} {-obj.bottom_offset[2]}')
+            world.worldbody.append(obj_body)
+            world.merge_assets(obj)
+            self.all_mujoco_objects[obj_name] = obj
+        self.object_bottom_z = np.array(self.object_bottom_z)
+
+        if self.multi_goal:
+            # Add dummy object for goal visualization
+            for t_set_name, t_set_kwargs in self.env_cfg.block_bottom.multi_goal_target_sets.items():
+                goal_object = BoxObject(
+                    name=f'{t_set_name}', 
+                    size=(np.array(t_set_kwargs.high)-np.array(t_set_kwargs.low))/2,
+                    rgba=t_set_kwargs.rgba,
+                    obj_type='visual',
+                    joints=None,
+                    duplicate_collision_geoms=False
+                )
+                goal_pos = (np.array(t_set_kwargs.high)+np.array(t_set_kwargs.low))/2
+                goal_object_body = goal_object.get_obj()
+                goal_object_body.set('pos', f'{goal_pos[0]} {goal_pos[1]} {goal_pos[2]}')
+                world.worldbody.append(goal_object_body)
+                world.merge_assets(goal_object)
+        else:
+            # Add dummy object for goal visualization
+            goal_object = BoxObject(
+                name='goal0', 
+                size=(np.array(self.env_cfg.block_bottom.target_set.high)-np.array(self.env_cfg.block_bottom.target_set.low))/2,
+                rgba=[0, 1, 0, 0.2],
+                obj_type='visual',
+                joints=None,
+                duplicate_collision_geoms=False
+            )
+            goal_pos = (np.array(self.env_cfg.block_bottom.target_set.high)+np.array(self.env_cfg.block_bottom.target_set.low))/2
+            goal_object_body = goal_object.get_obj()
+            goal_object_body.set('pos', f'{goal_pos[0]} {goal_pos[1]} {goal_pos[2]}')
+            world.worldbody.append(goal_object_body)
+            world.merge_assets(goal_object)
+
+        self.model = world.get_model(mode="mujoco")
+        self.data = mujoco.MjData(self.model)
+
+        self.sim = MjSim(self.model)
+        self.arm_qpos_index = [self.sim.model.get_joint_qpos_addr(x) for x in self.mujoco_robot.joints if 'wrist' not in x]
+        self.qvel_index = [self.sim.model.get_joint_qvel_addr(x) for x in self.mujoco_robot.joints]
+
+        self.wrist_qpos_index = [self.sim.model.get_joint_qpos_addr(x) for x in self.gripper.joints if 'wrist' in x]
+
+        self.gripper_qpos_index = [self.sim.model.get_joint_qpos_addr(x) for x in self.gripper.joints if 'finger' in x]
+
+        self._ref_joint_actuator_indexes = [
+            self.sim.model.actuator_name2id(actuator) for actuator in self.mujoco_robot.actuators
+        ]
+        self._ref_gripper_fingers_actuator_indexes = [
+            self.sim.model.actuator_name2id(actuator) for actuator in self.gripper.actuators if 'finger' in actuator
+        ]
+
+        self.robot_dof = len(self.mujoco_robot.actuators) + len(self.gripper.actuators)
+          
+    def reset_mocap_welds(self):
+        """Resets the mocap welds that we use for actuation."""
+        if self.model.nmocap > 0 and self.model.eq_data is not None:
+            for i in range(self.model.eq_data.shape[0]):
+                if self.model.eq_type[i] == mujoco.mjtEq.mjEQ_WELD:
+                    self.model.eq_data[i, :] = np.array(
+                        [0.,  0.,  0.,
+                        0.0,  0.,  0.,
+                        0., 1.,  0.,
+                        0.,  1.])
+        
+        mujoco.mj_forward(self.model, self.data)
+
+    def initialize_procedural_sampler(self):
+
+        object_samplers = []
+        block_bottom_sampler = UniformRandomSampler(
+            name=f"{self.env_cfg.block_bottom.block_name}_sampler",
+            x_range=[self.env_cfg.block_bottom.state_ranges.low[0], self.env_cfg.block_bottom.state_ranges.high[0]],
+            y_range=[self.env_cfg.block_bottom.state_ranges.low[1], self.env_cfg.block_bottom.state_ranges.high[1]],
+            rotation=0,  # do not Randomize orientation
+            ensure_object_boundary_in_range=True,
+            ensure_valid_placement=True,
+        )
+        object_samplers.append(block_bottom_sampler)
+        block_top_sampler = UniformRandomSampler(
+            name=f"{self.env_cfg.block_top.block_name}_sampler",
+            x_range=[self.env_cfg.block_top.state_ranges.low[0], self.env_cfg.block_top.state_ranges.high[0]],
+            y_range=[self.env_cfg.block_top.state_ranges.low[1], self.env_cfg.block_top.state_ranges.high[1]],
+            rotation=0,  # do not Randomize orientation
+            ensure_object_boundary_in_range=False,
+            ensure_valid_placement=True,
+            z_offset=0.02,
+        )
+        object_samplers.append(block_top_sampler)
+
+        object_state_ranges_single_goal = self.env_cfg.objects.get('state_ranges_single_goal', self.env_cfg.objects.state_ranges)
+        object_state_ranges = self.env_cfg.objects.state_ranges if self.multi_goal else object_state_ranges_single_goal
+
+        for obj_name in self.env_cfg.objects.names:
+            object_samplers.append(UniformRandomSampler(
+                name=f"{obj_name}_sampler",
+                x_range=[object_state_ranges.low[0], object_state_ranges.high[0]],
+                y_range=[object_state_ranges.low[1], object_state_ranges.high[1]],
+                rotation=0,  # do not Randomize orientation
+                ensure_object_boundary_in_range=True,
+                ensure_valid_placement=True,
+            ))
+
+        self.composite_sampler = SequentialCompositeSampler(name="table_sampler")
+        self.composite_sampler.append_sampler(object_samplers[0])
+        self.composite_sampler.append_sampler(object_samplers[1], sample_args={'reference': self.env_cfg.block_bottom.block_name, 'on_top': True})
+        for i in range(self.N_dist_objects):
+            self.composite_sampler.append_sampler(object_samplers[2+i])
+
+        for obj_name, mj_obj in self.all_mujoco_objects.items():
+            self.composite_sampler.add_objects_to_sampler(sampler_name=f"{obj_name}_sampler", mujoco_objects=mj_obj)
+
+    def check_bottom_block_crowding(self, state):
+        block_bottom_pos = state[:2]
+        block_bottom_low, block_bottom_high = self.get_object_bounds(self.env_cfg.block_bottom.block_name)
+
+        block_bottom_low[0] += 2*block_bottom_low[0] # space to slide forward
+        if self.less_crowded:
+            block_bottom_low[1] += block_bottom_low[1] # space to slide sideways
+            block_bottom_high[1] += block_bottom_high[1] # space to slide sideways
+        else:
+            block_bottom_low[1] += block_bottom_low[1]/2 # space to slide sideways
+            block_bottom_high[1] += block_bottom_high[1]/2 # space to slide sideways
+
+        gx = -1e6
+        for i, obj_name in enumerate(self.env_cfg.objects.names):
+            obj_pos = state[12+i*6:12+i*6+2]
+            obj_low, obj_high = self.get_object_bounds(obj_name)
+
+            obstacle_high = block_bottom_pos[:2] + block_bottom_high[:2] - obj_low[:2] + self.env_cfg.thresh
+            obstacle_low = block_bottom_pos[:2] + block_bottom_low[:2] - obj_high[:2] - self.env_cfg.thresh
+            obstacle = signed_dist_fn_rectangle(
+                obj_pos[:2], 
+                obstacle_low, 
+                obstacle_high,
+                obstacle=True)
+            
+            gx = np.maximum(gx, obstacle)
+        return gx>0
+            
+    def sample_initial_state(self, N):
+        # samples only the blocks and object locations
+        states = np.zeros((N, self.N_all_objects*self.low_dim_sizes['objects']))
+
+        if self.env_cfg.randomize_locations:
+            for idx in range(N):
+                succ = False
+                while not succ:
+                    obj_in_goal = False
+                    sample = self.composite_sampler.sample()
+                    for i, obj_name in enumerate(self.all_blocks_object_names):
+                        states[idx, i*6:i*6+3] = np.array(sample[obj_name][0])
+                        if self.env_cfg.block_bottom.target_set_type == 'absolute':
+                            _obj_state = np.concatenate([self.ee_pos.copy(), np.zeros(3), sample[obj_name][0]]).reshape(1,-1) # append ee state
+                            obj_in_goal = self.check_success(_obj_state)[0][0] or obj_in_goal
+                    full_state = np.concatenate([self.ee_pos.copy(), np.zeros(3), states[idx]]).reshape(1,-1) # append ee state
+                    fail, _ = self.check_failure(full_state)
+                    
+                    if self.env_cfg.get('reset_uncrowded', True):
+                        crowded = self.check_bottom_block_crowding(states[idx])
+                        succ = False if (fail[0] or crowded or obj_in_goal) else True
+                        # succ = False if (fail[0] or crowded) else True
+                    else:
+                        succ = False if fail[0] else True
+        else:
+            states[:, 0:2] = self.env_cfg.block_bottom.initial_pos
+            states[:, 6:8] = self.env_cfg.block_top.initial_pos
+            states[:,2] = self.block_bottom_z
+            states[:,8] = self.block_top_z
+            for i in range(self.N_dist_objects):
+                states[:, 12+i*6:12+i*6+2] = self.env_cfg.objects.initial_poses[i]
+                states[:, 12+i*6+2] = self.object_bottom_z[i]
+
+        return states
+    
+    def _reset_hand(self, steps=50):
+        self.data.qpos[self.arm_qpos_index] = np.array(self.env_cfg.init_arm_qpos) # robot joints
+        self.data.qpos[self.wrist_qpos_index] = np.array(self.env_cfg.init_wrist_qpos) # gripper wrist
+        self.data.qpos[self.gripper_qpos_index] = np.array(self.env_cfg.init_fingers_qpos) # gripper fingers
+
+        neq = self.model.eq_data.shape[0]
+        self.model.eq_active0[neq-1] = 0
+        self.data.eq_active[neq-1] = 0
+        self.suction_gripper_active = False
+        
+        for _ in range(steps):
+
+            self.data.mocap_pos = np.array(self.env_cfg.hand_init_pos)
+            self.data.mocap_quat = np.array(self.env_cfg.mocap_quat)
+
+            self.do_simulation([-1, 1], self.frame_skip)
+        self.init_tcp = self.tcp_center
+    
+    def _gravity_compensation(self):
+        torques = self.data.qfrc_bias[self.qvel_index]
+        self.data.ctrl[self._ref_joint_actuator_indexes] = torques
+
+    def set_xyz_action(self, action):
+        action = np.clip(action, -1, 1)
+        pos_delta = action * self.env_cfg.action_scale
+        new_mocap_pos = self.data.mocap_pos + pos_delta
+
+        new_mocap_pos[0, :] = np.clip(
+            new_mocap_pos[0, :],
+            np.array(self.env_cfg.mocap_low),
+            np.array(self.env_cfg.mocap_high),
+        )
+        # self.data.set_mocap_pos('mocap', new_mocap_pos)
+        # self.data.set_mocap_quat('mocap', np.array([1, 0, 1, 0]))
+
+        self.data.mocap_pos = new_mocap_pos.copy()
+        self.data.mocap_quat = np.array(self.env_cfg.mocap_quat)
+
+    def reset(self, start=None):
+        self._did_see_sim_exception = False
+        mujoco.mj_resetData(self.model, self.data)
+        self._reset_hand()
+
+        self._current_timestep = 0
+        self.failure_mode = None
+        self.colliding_obj_name = None
+
+        self.update_relevant_objs()
+        if self.use_constraint_types:
+            self.update_constraint_types()
+        
+        self.update_goal()
+
+        self.safety_set_top_low, self.safety_set_top_high = None, None
+        self.target_set_low, self.target_set_high = None, None
+        if start is None:
+            sample_state = self.sample_initial_state(1)[0]
+        else:
+            sample_state = start.copy()
+
+        self.failure_mode = None
+        self.colliding_obj_name = None
+        self._init_knn_objects = None
+
+        for i in range(self.N_all_objects):
+            self.data.qpos[self.robot_dof+i*7:self.robot_dof+i*7+3] = sample_state[i*6:i*6+3]
+
+        for _ in range(20):
+            self.do_simulation([-1, 1], self.frame_skip)
+        
+        self.ee_pos_tm1 = self.ee_pos.copy()
+
+        block_top_pos = self._get_body_pos(self.env_cfg.block_top.block_name)
+        self.safety_set_top_low = block_top_pos + self.env_cfg.block_top.safety_set.low
+        self.safety_set_top_high = block_top_pos + self.env_cfg.block_top.safety_set.high
+
+        if self.env_cfg.block_bottom.target_set_type == 'relative':
+            block_bot_pos = self._get_body_pos(self.env_cfg.block_bottom.block_name)
+            self.target_set_low = block_bot_pos + self.sampled_target_set_low
+            self.target_set_high = block_bot_pos + self.sampled_target_set_high
+        elif self.env_cfg.block_bottom.target_set_type == 'absolute':
+            self.target_set_low = self.sampled_target_set_low
+            self.target_set_high = self.sampled_target_set_high
+        else:
+            raise NotImplementedError('Target set type not implemented.')
+
+        if self.env_cfg.reset_grasped:
+            while not self.suction_gripper_active:
+                target_pos = self.get_suction_target()
+                action = target_pos - self.ee_pos
+                self.step(action)
+            self._current_timestep = 0
+
+        self.init_obj_pos = {}
+        for obj_name in self.env_cfg.objects.names:
+            self.init_obj_pos[obj_name] = self._get_body_pos(obj_name).copy()
+        
+        return self.get_current_relevant_state()
+      
+    def check_within_env(self, state=None):
+        """Checks if the robot is still in the environment.
+
+        Args:
+            state (np.ndarray): the state of the agent. shape = (batch, n)
+
+        Returns:
+            bool: True if the agent is not in the environment.
+        """
+        if state is None:
+            _ee_pos = self.ee_pos.reshape(1,-1) # shape = (batch, 3)
+            _bottom_block_pos = self.bottom_block_pos.reshape(1,-1) # shape (batch, 3)
+            _top_block_pos = self.top_block_pos.reshape(1,-1) # shape (batch, 3)
+        else:
+            _ee_pos = state[...,:3].copy()
+            _bottom_block_pos = state[...,6:9].copy()
+            _top_block_pos = state[...,12:15].copy()
+
+        # EE within table
+        outsideLeft_ee = np.any((_ee_pos <= self.env_bound_low), axis=-1)
+        outsideRight_ee = np.any((_ee_pos >= self.env_bound_high), axis=-1)
+        outside_ee = np.logical_or(outsideLeft_ee, outsideRight_ee)
+
+        # Bottom bottom within table
+        outsideLeft_bottom = np.any((_bottom_block_pos <= self.env_bound_low), axis=-1)
+        outsideRight_bottom = np.any((_bottom_block_pos >= self.env_bound_high), axis=-1)
+        outside_bottom = np.logical_or(outsideLeft_bottom, outsideRight_bottom)
+
+        # Bottom top within table
+        outsideLeft_top = np.any((_top_block_pos <= self.env_bound_low), axis=-1)
+        outsideRight_top = np.any((_top_block_pos >= self.env_bound_high), axis=-1)
+        outside_top = np.logical_or(outsideLeft_top, outsideRight_top)
+
+        return np.logical_or(np.logical_or(outside_bottom, outside_top), outside_ee)
+
+    def do_simulation(self, ctrl, n_frames=None):
+        if self._did_see_sim_exception:
+            return
+
+        if n_frames is None:
+            n_frames = self.frame_skip
+
+        if self.env_cfg.gravity_compensation:
+            self._gravity_compensation()
+        
+        self.data.ctrl[self._ref_gripper_fingers_actuator_indexes] = ctrl
+
+        for _ in range(n_frames):
+            try:
+                mujoco.mj_step(self.model, self.data)
+            except mujoco.MujocoException as err:
+                warnings.warn(str(err), category=RuntimeWarning)
+                self._did_see_sim_exception = True
+
+    def get_normalized_pos(self, pos):
+        return 2*(pos - self.env_bound_low) / (self.env_bound_high - self.env_bound_low) - 1.0
+
+    def get_topk_obj_mask(self, ee_pos, x_dist):
+        dist = np.linalg.norm(ee_pos - x_dist, axis=1)
+        sorted_indices = np.argsort(dist)[:self.env_cfg.tok_k_mask] + 3
+
+        mask = np.zeros((self.N_all_objects+1,self.N_all_objects+1))
+        mask[:3, sorted_indices] = 1
+        mask[:3,:3] = 1 # ee, block bottom and top attend to one another
+        mask[-self.N_dist_objects:,-self.N_dist_objects:] = np.eye(self.N_dist_objects) #np.eye(self.N_dist_objects) # objects attend to themselves
+        mask[sorted_indices, :3] = 1
+
+        any_contact_indices = [3+i for i, name in enumerate(self.rel_obj_names) if self.pred_constraint_types[name] == 'any_contact']
+        mask[:3, any_contact_indices] = 0
+        mask[any_contact_indices, :3] = 0
+
+        return mask
+    
+    def get_current_relevant_state(self):
+        """ 
+            Returns states of self.observations for the environment:
+        """
+        obs = {} # observation dict
+        ee_vel_t = (self.ee_pos-self.ee_pos_tm1)/self.dt
+
+        if self.constraint_type_repr == 'int':
+            const_type_rep = [self.object_type_to_int_mapping['ee']]
+        elif self.constraint_type_repr == 'one_hot':
+            const_type_rep = np.zeros(self.max_constraint_types)
+            const_type_rep[self.object_type_to_int_mapping['ee']] = 1
+
+        if self.use_constraint_types:
+            ee_state = np.concatenate([self.ee_pos, ee_vel_t, const_type_rep])
+        else:
+            ee_state = np.concatenate([self.ee_pos, ee_vel_t])
+
+        semantics = [const_type_rep]
+
+        if self.multi_goal:
+            ee_state = np.append(ee_state, self.target_set_to_int_mapping[self.target_set_name])
+            semantics = [np.append(const_type_rep, self.target_set_to_int_mapping[self.target_set_name])]
+
+        if self.normalize_pos:
+            ee_state[:3] = self.get_normalized_pos(ee_state[:3])
+
+        obs['robot_state'] = ee_state
+
+        if 'objects_state' in self.observations['low_dim']:
+            xt_stack, semantics_stack = [], []
+            for i, body_name in enumerate([self.env_cfg.block_bottom.block_name, self.env_cfg.block_top.block_name]):
+                
+                if self.constraint_type_repr == 'int':
+                    const_type_rep = [self.object_type_to_int_mapping[body_name]]
+                elif self.constraint_type_repr == 'one_hot':
+                    const_type_rep = np.zeros(self.max_constraint_types)
+                    const_type_rep[self.object_type_to_int_mapping[body_name]] = 1
+                
+                if self.use_constraint_types:
+                    body_state = np.concatenate([
+                        self._get_body_pos(body_name), 
+                        self._get_body_vel(body_name),
+                        const_type_rep]
+                    )
+                else:
+                    body_state = np.concatenate([
+                        self._get_body_pos(body_name), 
+                        self._get_body_vel(body_name)]
+                    )
+
+                if self.multi_goal:
+                    body_state = np.append(body_state, self.target_set_to_int_mapping[self.target_set_name])
+                    const_type_rep = np.append(const_type_rep, self.target_set_to_int_mapping[self.target_set_name])
+                
+                if self.normalize_pos:
+                    body_state[:3] = self.get_normalized_pos(body_state[:3])
+                
+                xt_stack.append(body_state)
+                semantics_stack.append(const_type_rep)
+
+            xt_dist, semantics_dist = [], []
+            for i, body_name in enumerate(self.rel_obj_names):
+                if self.use_constraint_types:
+                    if self.constraint_type_repr == 'int':
+                        const_type_rep = [self.constraint_to_int_mapping[self.pred_constraint_types[body_name]]]
+                    elif self.constraint_type_repr == 'one_hot':
+                        const_type_rep = np.zeros(self.max_constraint_types)
+                        const_type_rep[self.constraint_to_int_mapping[self.pred_constraint_types[body_name]]] = 1
+                    
+
+                    body_state = np.concatenate([
+                        self._get_body_pos(body_name), 
+                        self._get_body_vel(body_name), 
+                        const_type_rep])
+                    
+                else:
+                    body_state = np.append(self._get_body_pos(body_name), self._get_body_vel(body_name))
+                
+                if self.multi_goal:
+                    body_state = np.append(body_state, self.target_set_to_int_mapping[self.target_set_name])
+                    const_type_rep = np.append(const_type_rep, self.target_set_to_int_mapping[self.target_set_name])
+
+                if self.normalize_pos:
+                    body_state[:3] = self.get_normalized_pos(body_state[:3])
+
+                xt_dist.append(body_state)
+                semantics_dist.append(const_type_rep)
+
+            if self.append_stack_to_robot_state:
+                obs['robot_state'] = np.concatenate([ee_state, *xt_stack])
+                obs['objects_state'] = np.vstack(xt_dist)
+                if 'objects_semantics' in self.observations['low_dim']:
+                    obs['objects_semantics'] = np.vstack(semantics + semantics_dist)
+                if 'objects_mask' in self.observations['low_dim']:
+                    raise NotImplementedError('Mask not implemented for stack to robot state.')
+            else:
+                obs['objects_state'] = np.stack(xt_stack+xt_dist, axis=0)
+                if 'objects_semantics' in self.observations['low_dim']:
+                    obs['objects_semantics'] = np.vstack(semantics + semantics_stack + semantics_dist)
+                if 'objects_mask' in self.observations['low_dim']:
+                    obs['objects_mask'] = self.get_topk_obj_mask(ee_state[:3], np.vstack(xt_dist)[:, :3])
+
+        if 'rgb_front_cam' in self.observations['rgb']:
+            obs['rgb_front_cam'] = self.get_current_image(self.front_cam_name)
+        if 'rgb_eye_in_hand_cam' in self.observations['rgb']:
+            obs['rgb_eye_in_hand_cam'] = self.get_current_image(self.eye_in_hand_cam_name)
+        return obs
+    
+    def get_current_full_state(self):
+        ee_vel_t = (self.ee_pos-self.ee_pos_tm1)/self.dt
+        xt = np.append(self.ee_pos, ee_vel_t)
+        for i, body_name in enumerate([self.env_cfg.block_bottom.block_name, self.env_cfg.block_top.block_name]):
+            body_state = np.append(self._get_body_pos(body_name), self._get_body_vel(body_name))
+            xt = np.append(xt, body_state)
+
+        for i, body_name in enumerate(self.env_cfg.objects.names):
+            if self.use_constraint_types:
+                body_state = np.concatenate([
+                    self._get_body_pos(body_name), 
+                    self._get_body_vel(body_name), 
+                    [self.constraint_to_int_mapping[self.pred_constraint_types[body_name]]]])
+            else:
+                body_state = np.append(self._get_body_pos(body_name), self._get_body_vel(body_name))
+            xt = np.append(xt, body_state)
+        return xt
+    
+    def check_contact_slide(self):
+        for contact in self.data.contact[: self.data.ncon]:
+            # check contact geom in geoms; add to contact set if match is found
+            # g1, g2 = self.model.geom_id2name(contact.geom1), self.model.geom_id2name(contact.geom2)
+
+            g1 = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_GEOM, contact.geom1)
+            g2 = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_GEOM, contact.geom2)
+            # print(f'{g1=}  {g2=}')
+
+            if (g1 is None) or (g2 is None):
+                continue
+
+            if (g1 in self.gripper.contact_geoms) and (self.env_cfg.block_bottom.block_name in g2):
+                return True
+
+            if (g2 in self.gripper.contact_geoms) and (self.env_cfg.block_bottom.block_name in g1):
+                return True
+            
+        return False
+
+    def check_suction_grasp(self):
+        grasp_object_idx = 0
+        if self.check_contact_slide() and not self.suction_gripper_active:
+            site1_name = "gripper0_grip_site"
+            site2_name = "suction_site"
+            site1_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SITE, site1_name)
+            site2_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SITE, site2_name)
+            neq = self.model.eq_data.shape[0]
+            self.model.eq_type[neq-1] = 1  # 1 corresponds to a 'weld' constraint
+            self.model.eq_obj1id[neq-1] = site1_id
+            self.model.eq_obj2id[neq-1] = site2_id
+            self.model.eq_active0[neq-1] = 1
+            self.data.eq_active[neq-1] = 1
+            self.model.eq_objtype[neq-1] = 6 # site
+            self.suction_gripper_active = True
+
+            self.sim.forward()
+
+    # == Dynamics ==
+    def step(self, action):
+        xt = self.get_current_relevant_state()
+        self.ee_pos_tm1 = self.ee_pos.copy()
+
+        fail, g_x = self.check_failure()
+        success, l_x = self.check_success()
+
+        done = self.get_done(None, success, fail)[0]
+        cost, l_x, g_x = self.get_cost(l_x, g_x, success, fail)
+        info = {"g_x": g_x[0], "l_x": l_x[0]}
+        info['failure_mode'] = self.failure_mode
+        
+        self.set_xyz_action(action[:3])
+        self.do_simulation([-1, 1]) # Gripper always closed
+        self.check_suction_grasp()
+        
+        xtp1 = self.get_current_relevant_state()
+        self._current_timestep += 1
+        return xtp1, cost[0], done, info
+
+    def render(self):
+        pass
+    
+    def get_suction_target(self):
+
+        # target_pos = self.bottom_block_pos.copy()
+        # target_pos[0] = target_pos[0] - self.bottom_hor_rad[0] + 0.03
+
+        target_pos = self._get_site_pos('suction_site')
+
+        site_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SITE, 'placeSiteB')
+        self.model.site_pos[site_id] = target_pos             
+        return target_pos
+
+    def get_action(self):
+        action = np.zeros(3)
+        if self.suction_gripper_active:
+            # action[:3] = [-0.4, 0, 0.001]
+            target_pos = (self.target_set_high + self.target_set_low)/2 # [0., 0.3, 0.1]
+            action[:3] = target_pos - self.ee_pos[:3]
+        else:
+            target_pos = self.get_suction_target()
+            action[:3] = target_pos - self.ee_pos
+            # viewer.launch(self.model, self.data)
+
+        return action
+
+    def get_object_bounds(self, obj_name):
+        if isinstance(self.all_mujoco_objects[obj_name], BoxObject):
+            obj_hor_rad = self.all_mujoco_objects[obj_name].size
+            obj_low = -1*np.array(obj_hor_rad)
+            obj_high = 1*np.array(obj_hor_rad)
+        elif isinstance(self.all_mujoco_objects[obj_name], MujocoXMLObject):
+            hor_site = self.all_mujoco_objects[obj_name].worldbody.find(f"./body/site[@name='{obj_name}_horizontal_radius_site']")
+            obj_hor_rad = string_to_array(hor_site.get("pos"))
+            obj_hor_rad[2] = 0
+
+            obj_low = -1*obj_hor_rad
+            obj_high = 1*obj_hor_rad
+
+            bottom_site = self.all_mujoco_objects[obj_name].worldbody.find(f"./body/site[@name='{obj_name}_bottom_site']")
+            obj_low[2] = string_to_array(bottom_site.get("pos"))[2]
+
+            top_site = self.all_mujoco_objects[obj_name].worldbody.find(f"./body/site[@name='{obj_name}_top_site']")
+            obj_high[2] = string_to_array(top_site.get("pos"))[2]
+        else:
+            raise NotImplementedError('Object type not implemented!')
+
+        return obj_low, obj_high
+        
+    def collision_distance(self, obj1_name, obj1_state, obj2_name, obj2_state):
+        # g(x)>0 is obstacle
+
+        obj1_low, obj1_high = self.get_object_bounds(obj1_name)
+        obj2_low, obj2_high = self.get_object_bounds(obj2_name)
+
+        obstacle_high = obj1_state[...,:3] + obj1_high - obj2_low + self.env_cfg.thresh
+        obstacle_low = obj1_state[...,:3] + obj1_low - obj2_high - self.env_cfg.thresh
+        obstacle = signed_dist_fn_rectangle(
+            obj2_state[...,:3], 
+            obstacle_low, 
+            obstacle_high,
+            obstacle=True)
+        return obstacle
+
+    def constraint_distance(
+        self, 
+        obj1_name, 
+        obj1_pos,
+        obj1_vel, 
+        obj2_name, 
+        obj2_pos,
+        obj2_vel,
+    ):
+        # g(x)>0 is obstacle
+        obstacle = self.collision_distance(obj1_name, obj1_pos, obj2_name, obj2_pos)
+
+        if 'no_contact' in self.obj_to_constraint_map[obj2_name]:
+            if obstacle[0]>0 and self.failure_mode is None:
+                self.failure_mode = 'collision_no_contact'
+                self.colliding_obj_name = obj2_name
+        elif 'any_contact' in self.obj_to_constraint_map[obj2_name]:
+            obstacle = -1e6*np.ones(obstacle.shape)
+        elif 'soft_contact' in self.obj_to_constraint_map[obj2_name]:
+            velocity_const =  np.linalg.norm(obj1_vel-obj2_vel, axis=-1) - self.env_cfg.vel_thresh
+            obstacle = velocity_const*(obstacle>0) + -1e6*np.ones(obstacle.shape)*(obstacle<0)
+            if obstacle[0]>0 and self.failure_mode is None:
+                self.failure_mode = 'collision_soft_contact'
+                self.colliding_obj_name = obj2_name
+        elif 'no_over' in self.obj_to_constraint_map[obj2_name]:
+            xy_dist =  np.linalg.norm(obj1_pos[...,:2]-obj2_pos[...,:2], axis=-1) - self.env_cfg.thresh
+            if (obstacle[0]>0 or xy_dist[0]<0) and self.failure_mode is None:
+                self.failure_mode = 'collision_no_over'
+                self.colliding_obj_name = obj2_name
+        else:
+            raise NotImplementedError('Contraint type not implemented!')
+
+        return obstacle
+        
+
+    def safety_margin(self, s=None, safety_set_top_low=None, safety_set_top_high=None):
+        # Input:s top block position, shape (batch, 3)
+        # g(x)>0 is obstacle
+
+        if s is None:
+            _ee_pos = self.ee_pos.reshape(1,-1)
+            _bottom_block_pos = self.bottom_block_pos.reshape(1,-1) # shape (batch, 3)
+            _bottom_block_vel = self._get_body_vel(self.env_cfg.block_bottom.block_name).reshape(1,-1) # shape (batch, 3)
+            _top_block_pos = self.top_block_pos.reshape(1,-1) # shape (batch, 3)
+        else:
+            _ee_pos = s[...,:3].copy()
+            _bottom_block_pos = s[...,6:9].copy()
+            _bottom_block_vel = s[...,9:12].copy()
+            _top_block_pos = s[...,12:15].copy()
+            
+        if safety_set_top_low is None:
+            safety_set_top_low = _top_block_pos + self.env_cfg.block_top.safety_set.low
+
+        if safety_set_top_high is None:
+            safety_set_top_high = _top_block_pos + self.env_cfg.block_top.safety_set.high
+
+        # top block safety: stay within safety bounds
+        gx = signed_dist_fn_rectangle(
+            _top_block_pos, 
+            safety_set_top_low, 
+            safety_set_top_high)
+
+        if gx[0]>0:
+            self.failure_mode = 'top_block_oob'
+
+        if not self.env_cfg.reset_grasped:
+            # gripper should not hit top block
+            obj_low, obj_high = self.get_object_bounds(self.env_cfg.block_top.block_name)
+            obstacle_high = _top_block_pos + obj_high + self.env_cfg.thresh
+            obstacle_low = _top_block_pos + obj_low - self.env_cfg.thresh
+            obstacle = signed_dist_fn_rectangle(
+                _ee_pos, 
+                obstacle_low, 
+                obstacle_high,
+                obstacle=True)
+            gx = np.maximum(gx, obstacle)
+
+        # obstacle avoidance between bottom block and distractors
+        for i, obj_name in enumerate(self.env_cfg.objects.names):
+            _obj_pos = self._get_body_pos(obj_name) if s is None else s[...,18+i*6:18+i*6+3]
+            _obj_vel = self._get_body_vel(obj_name) if s is None else s[...,18+i*6+3:18+i*6+6]
+            obstacle = self.constraint_distance(
+                self.env_cfg.block_bottom.block_name, 
+                _bottom_block_pos, 
+                _bottom_block_vel,
+                obj_name, 
+                _obj_pos, 
+                _obj_vel,)
+            
+            gx = np.maximum(gx, obstacle)
+        
+        gx = self.scaling_safety * gx
+
+        if 'reward' in self.return_type: # g(x)<0 is obstacle
+            gx = -1.*gx
+        return gx
+
+    def target_margin(self, s=None, target_set_low=None, target_set_high=None):
+        """Computes the margin (e.g. distance) between the state and the target set.
+
+        Args:
+            s (np.ndarray): the state of the agent. shape (batch, n)
+
+        Returns:
+            float: negative numbers indicate reaching the target. If the target set
+                is not specified, return None.
+        """
+        # l(x)<0 is target
+        if s is None:
+            _ee_pos = self.ee_pos.reshape(1,-1)
+            _bottom_block_pos = self.bottom_block_pos.reshape(1,-1) # shape (batch, 3)
+            _top_block_pos = self.top_block_pos.reshape(1,-1) # shape (batch, 3)
+        else:
+            _ee_pos = s[...,:3].copy()
+            _bottom_block_pos = s[...,6:9].copy()
+            _top_block_pos = s[...,12:15].copy()
+
+        if target_set_low is None:
+            if self.env_cfg.block_bottom.target_set_type == 'relative':
+                target_set_low = _bottom_block_pos + self.sampled_target_set_low
+            elif self.env_cfg.block_bottom.target_set_type == 'absolute':
+                target_set_low = self.sampled_target_set_low
+            else:
+                raise NotImplementedError('Target set type not implemented.')
+        if target_set_high is None:
+            if self.env_cfg.block_bottom.target_set_type == 'relative':
+                target_set_high = _bottom_block_pos + self.sampled_target_set_high
+            elif self.env_cfg.block_bottom.target_set_type == 'absolute':
+                target_set_high = self.sampled_target_set_high
+            else:
+                raise NotImplementedError('Target set type not implemented.')
+
+        # block bottom goal
+        lx = signed_dist_fn_rectangle(
+            _bottom_block_pos, 
+            target_set_low, 
+            target_set_high)
+
+        # Goto suction target
+        if not self.env_cfg.reset_grasped:
+            _target_pos = self.get_suction_target()
+            suction_lx = np.linalg.norm(_ee_pos-_target_pos, axis=-1) - self.env_cfg.thresh
+            lx = np.maximum(suction_lx, lx)
+
+        lx = self.scaling_target * lx
+        if 'reward' in self.return_type: # l(x)>0 is target
+            lx = -1.*lx
+
+        return lx
+
+    def check_failure(self, state=None):
+        g_x = self.safety_margin(state, self.safety_set_top_low, self.safety_set_top_high)
+        if 'reward' in self.return_type: 
+            return g_x<0, g_x
+        else:
+            return g_x>0, g_x # g(x)>0 is failure
+    
+    def check_contact(self, obj1_name, obj2_name):
+        for contact in self.data.contact[: self.data.ncon]:
+            # check contact geom in geoms; add to contact set if match is found
+            # g1, g2 = self.model.geom_id2name(contact.geom1), self.model.geom_id2name(contact.geom2)
+
+            g1 = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_GEOM, contact.geom1)
+            g2 = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_GEOM, contact.geom2)
+
+            if (g1 is None) or (g2 is None):
+                continue
+
+            if (obj2_name in g1) and (obj1_name in g2):
+                return True
+
+            if (obj1_name in g1) and (obj2_name in g2):
+                return True
+            
+        return False
+    
+    def is_toppled(self, obj_name):
+        body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, f'{obj_name}_main')
+        quat_body = self.data.xquat[body_id]
+
+        xyz = Rotation.from_quat(quat_body, scalar_first=True).as_euler('xyz', degrees=True)
+        del_z = np.abs(xyz[2])
+        shortest_angle = np.minimum(del_z, 180-del_z)
+
+        toppled = shortest_angle > self.env_cfg.get('toppl_thresh', 15)
+        return toppled
+    
+    def is_over(self, obj1_name, obj2_name):
+        obj1_pos = self._get_body_pos(obj1_name)
+        obj2_pos = self._get_body_pos(obj2_name)
+
+        xy_dist =  np.linalg.norm(obj1_pos[:2]-obj2_pos[:2]) - self.env_cfg.thresh
+        return xy_dist<0
+
+    def check_real_failure(self):
+
+        # top block safety: stay within safety bounds
+        gx = signed_dist_fn_rectangle(
+            self.top_block_pos.reshape(1,-1), 
+            self.safety_set_top_low, 
+            self.safety_set_top_high)
+
+        if gx[0]>0:
+            self.failure_mode = 'top_block_oob'
+            return True
+        else:
+            # Check for collision
+            for i, obj_name in enumerate(self.env_cfg.objects.names):
+                in_collision = self.check_contact(self.env_cfg.block_bottom.block_name, obj_name)
+
+                if 'no_contact' in self.obj_to_constraint_map[obj_name]:
+                    if in_collision:
+                        self.failure_mode = 'collision_no_contact'
+                        self.colliding_obj_name = obj_name
+                        return True
+                elif 'any_contact' in self.obj_to_constraint_map[obj_name]:
+                    continue
+                elif 'soft_contact' in self.obj_to_constraint_map[obj_name]:
+                    if in_collision and self.is_toppled(obj_name):
+                        self.failure_mode = 'collision_soft_contact'
+                        self.colliding_obj_name = obj_name
+                        return True
+                elif 'no_over' in self.obj_to_constraint_map[obj_name]:
+                    if in_collision or self.is_over(self.env_cfg.block_bottom.block_name, obj_name):
+                        self.failure_mode = 'collision_no_over'
+                        self.colliding_obj_name = obj_name
+                        return True
+                else:
+                    raise NotImplementedError('Contraint type not implemented!')
+        return False
+
+    def check_success(self, state=None):
+        l_x = self.target_margin(state, self.target_set_low, self.target_set_high)
+        if 'reward' in self.return_type: 
+            return l_x>0, l_x
+        else:
+            return l_x<0, l_x # l(x)<0 is target
+    
+    def get_sorted_objects(self):
+        dist = np.zeros(self.N_dist_objects)
+        for i, body_name in enumerate(self.env_cfg.objects.names):
+            dist[i] = np.linalg.norm(self._get_body_pos(body_name) - self.bottom_block_pos)
+        sorted_indices = np.argsort(dist)
+        rel_objs = [self.env_cfg.objects.names[int(sorted_indices[j])] for j in range(len(sorted_indices))]
+        return rel_objs
+    
+    def get_rel_objects(self, mode):
+        if 'dynamic_knn' in mode.lower():
+            rel_objs = self.get_sorted_objects()[:self.env_cfg.n_rel_objs]
+        elif 'static_knn' in mode.lower():
+            if self._init_knn_objects is None:
+                rel_objs = self.get_sorted_objects()[:self.env_cfg.n_rel_objs]
+                self._init_knn_objects = rel_objs.copy()
+            else:
+                rel_objs = self._init_knn_objects.copy()
+        elif 'none' in mode.lower():
+            return [self.env_cfg.objects.names[i] for i in range(self.env_cfg.n_rel_objs)]
+        elif 'gt' in mode.lower():
+            # Choose the closest fragile objects
+            rel_objs = [obj for obj in self.get_sorted_objects() if 'mug' in obj][:self.env_cfg.n_rel_objs]
+        else:
+            raise NotImplementedError(f"Relevant object detector: {mode} not implemented.")
+        
+        return rel_objs
+
+    def plot_trajectory(self, state, action, save_filename):
+        """ 
+            state_dict: list of dicts
+            state shape = (T+1, self.n)
+            action shape = (T, self.m)
+        """
+
+        _rows = 4 if self.use_constraint_types else 3
+        fig, axes = plt.subplots(_rows, 3, figsize=(16, 16))
+
+        
+        ee_state = np.stack([s['robot_state'][:6] for s in state], axis=0)
+        if self.append_stack_to_robot_state:
+            block_bottom_state = np.stack([s['robot_state'][self.low_dim_sizes['robot0']:self.low_dim_sizes['robot0']+self.low_dim_sizes['objects']] for s in state], axis=0)
+            block_top_state = np.stack([s['robot_state'][self.low_dim_sizes['robot0']+self.low_dim_sizes['objects']:self.low_dim_sizes['robot0']+2*self.low_dim_sizes['objects']] for s in state], axis=0)
+        else:
+            block_bottom_state = np.stack([s['objects_state'][0] for s in state], axis=0)
+            block_top_state = np.stack([s['objects_state'][1] for s in state], axis=0)
+        
+        # plot position
+        axes[0,0].plot(ee_state[:,0], label='EE x')
+        axes[0,0].plot(block_bottom_state[:,0], label='Bottom block x')
+        axes[0,0].plot(block_top_state[:,0], label='Top block x')
+
+        axes[0,1].plot(ee_state[:,1], label='EE y')
+        axes[0,1].plot(block_bottom_state[:,1], label='Bottom block y')
+        axes[0,1].plot(block_top_state[:,1], label='Top block y')
+
+        axes[0,2].plot(ee_state[:,2], label='EE z')
+        axes[0,2].plot(block_bottom_state[:,2], label='Bottom block z')
+        axes[0,2].plot(block_top_state[:,2], label='Top block z')
+
+        # plot velocity
+        axes[1,0].plot(ee_state[:,3], label='EE x vel')
+        axes[1,0].plot(block_bottom_state[:,3], label='Bottom block x vel')
+        axes[1,0].plot(block_top_state[:,3], label='Top block x vel')
+
+        axes[1,1].plot(ee_state[:,4], label='EE y vel')
+        axes[1,1].plot(block_bottom_state[:,4], label='Bottom block y vel')
+        axes[1,1].plot(block_top_state[:,4], label='Top block y vel')
+
+        axes[1,2].plot(ee_state[:,5], label='EE z vel')
+        axes[1,2].plot(block_bottom_state[:,5], label='Bottom block z vel')
+        axes[1,2].plot(block_top_state[:,5], label='Top block z vel')
+
+        for i in range(self.env_cfg.n_rel_objs):
+
+            if self.append_stack_to_robot_state:
+                block_state = np.stack([s['objects_state'][i] for s in state], axis=0)            
+            else:
+                block_state = np.stack([s['objects_state'][i+2] for s in state], axis=0)
+
+            axes[0,0].plot(block_state[:,0], label=f'{self.rel_obj_names[i]} x')
+            axes[0,1].plot(block_state[:,1], label=f'{self.rel_obj_names[i]} y')
+            axes[0,2].plot(block_state[:,2], label=f'{self.rel_obj_names[i]} z')
+
+            axes[1,0].plot(block_state[:,3], label=f'{self.rel_obj_names[i]} x vel')
+            axes[1,1].plot(block_state[:,4], label=f'{self.rel_obj_names[i]} y vel')
+            axes[1,2].plot(block_state[:,5], label=f'{self.rel_obj_names[i]} z vel')
+
+            if self.use_constraint_types:
+                axes[3,0].plot(block_state[:,6], label=f'{self.rel_obj_names[i]} x')
+
+        # control on bottom block
+        axes[2,0].plot(action[:,0], label='u_x')
+        axes[2,0].set_xlabel(f't')
+        axes[2,0].set_ylabel(f'u_x')
+        axes[2,0].set_title(f'Control x')
+        axes[2,0].legend()
+
+        axes[2,1].plot(action[:,1], label='u_y')
+        axes[2,1].set_xlabel(f't')
+        axes[2,1].set_ylabel(f'u_y')
+        axes[2,1].set_title(f'Control y')
+        axes[2,1].legend()
+
+        axes[2,2].plot(action[:,2], label='u_z')
+        axes[2,2].set_xlabel(f't')
+        axes[2,2].set_ylabel(f'u_z')
+        axes[2,2].set_title(f'Control z')
+        axes[2,2].legend()
+
+        axes[0,0].set_xlabel(f't')
+        axes[0,0].set_ylabel(f'x')
+        axes[0,0].set_title(f'x pos')
+        axes[0,0].legend()
+        
+        axes[0,1].set_xlabel(f't')
+        axes[0,1].set_ylabel(f'y')
+        axes[0,1].set_title(f'y pos')
+        axes[0,1].legend()
+
+        axes[0,2].set_xlabel(f't')
+        axes[0,2].set_ylabel(f'z')
+        axes[0,2].set_title(f'z pos')
+        axes[0,2].legend()
+
+        axes[1,0].set_xlabel(f't')
+        axes[1,0].set_ylabel(f'xdot')
+        axes[1,0].set_title(f'x vel')
+        axes[1,0].legend()
+
+        axes[1,1].set_xlabel(f't')
+        axes[1,1].set_ylabel(f'ydot')
+        axes[1,1].set_title(f'y vel')
+        axes[1,1].legend()
+
+        axes[1,2].set_xlabel(f't')
+        axes[1,2].set_ylabel(f'zdot')
+        axes[1,2].set_title(f'z vel')
+        axes[1,2].legend()
+        if self.use_constraint_types:
+            axes[3,0].set_xlabel(f't')
+            axes[3,0].set_ylabel(f'constraint type')
+            axes[3,0].set_title(f'constraint type')
+            axes[3,0].legend()
+
+        plt.savefig(save_filename)
+        plt.close()
+
+    def plot_value_fn(
+        self, 
+        value_fn, 
+        grid_x, 
+        target_T=None, 
+        obstacle_T=None, 
+        trajs=[], 
+        save_dir='', 
+        name='',
+        debug=True
+    ):
+      
+        save_plot_name = os.path.join(save_dir, f'Value_fn_{name}.png')
+        # Plot contour plot
+        plt.figure(figsize=(8, 6))
+
+        max_V = np.max(np.abs(value_fn))
+        levels=np.arange(-max_V, max_V, 0.01)
+        levels=np.linspace(-max_V, max_V, 5) if len(levels) < 5 else levels
+        plt.contourf(grid_x[...,0], grid_x[...,1], value_fn, levels=levels, cmap='seismic')
+        
+        plt.colorbar(label='Value fn')
+        plt.xlabel('X')
+        plt.ylabel('X dot')
+
+        plt.contour(grid_x[...,0], grid_x[...,1], value_fn, levels=[0], colors='black', linewidths=2)
+
+        if target_T is not None:
+            targ = plt.contour(grid_x[...,0], grid_x[...,1], target_T, levels=[0], colors='green', linestyles='dashed')
+            # plt.clabel(targ, fontsize=12, inline=1, fmt='target')
+        if obstacle_T is not None:
+            obst = plt.contour(grid_x[...,0], grid_x[...,1], obstacle_T, levels=[0], colors='darkred', linestyles='dashed')
+            # plt.clabel(obst, fontsize=12, inline=1, fmt='obstacle')
+
+        for traj in trajs:
+            plt.plot(traj[:,0],traj[:,1])
+
+        plt.savefig(save_plot_name)
+        plt.close()
+        if not debug:
+            wandb.log({f"Value_fn_{name}": wandb.Image(save_plot_name)})
+
+    def plot_env(self, save_dir=''):
+      
+        save_plot_name = os.path.join(save_dir, f'target_and_obstacle_set_SlidePickupMujocoEnv.png')
+
+        fig, axes = plt.subplots(3, figsize=(12, 12))
+
+        max_V = np.max(np.abs(self.target_T))
+        levels=np.arange(-max_V, max_V, 0.01)
+        levels=np.linspace(-max_V, max_V, 11) if len(levels) < 11 else levels
+            
+        ctr_t = axes[0].contourf(self.grid_x[...,0], self.grid_x[...,1], self.target_T, levels=levels, cmap='seismic')
+        targ = axes[0].contour(self.grid_x[...,0], self.grid_x[...,1], self.target_T, levels=[0], colors='black')
+        axes[0].set_title(f'Target set l(x)')
+        axes[0].set_xlabel('X')
+        axes[0].set_ylabel('Y')
+        # axes[0].clabel(targ, fontsize=12, inline=1, fmt='target')
+        fig.colorbar(ctr_t, ax=axes[0])
+
+
+        max_V = np.max(np.abs(self.obstacle_T))
+        levels=np.arange(-max_V, max_V, 0.01)
+        levels=np.linspace(-max_V, max_V, 11) if len(levels) < 11 else levels
+        ctr_o = axes[1].contourf(self.grid_x[...,0], self.grid_x[...,1], self.obstacle_T, levels=levels, cmap='seismic')
+        obst = axes[1].contour(self.grid_x[...,0], self.grid_x[...,1], self.obstacle_T, levels=[0], colors='black')
+        axes[1].set_title(f'Obstacle set g(x)')
+        axes[1].set_xlabel('X')
+        axes[1].set_ylabel('Y')
+        # axes[1].clabel(obst, fontsize=12, inline=1, fmt='obstacle')
+        fig.colorbar(ctr_o, ax=axes[1])
+
+        ra = np.maximum(self.obstacle_T, self.target_T)
+
+        ctr_ra = axes[2].contourf(self.grid_x[...,0], self.grid_x[...,1], ra, levels=np.arange(-2, 2, 0.1), cmap='seismic')
+        axes[2].contour(self.grid_x[...,0], self.grid_x[...,1], ra, levels=[0], colors='black')
+        axes[2].set_title(f'Terminal Value fn')
+        axes[2].set_xlabel('X')
+        axes[2].set_ylabel('Y')
+        fig.colorbar(ctr_ra, ax=axes[2])
+
+        plt.savefig(save_plot_name)
+        plt.close()
+
+
+if __name__ == "__main__":
+    import VLTSafe_rl_safe_transformer
+
+    from omegaconf import OmegaConf
+    import imageio
+    from PIL import Image
+
+    out_folder = '/home/saumyas/Projects/safe_control/VLTSafe_rl_safe_transformer/outputs/media/slide_pickup_clutter_multimodal/'
+    env_cfg = OmegaConf.load('/home/saumyas/Projects/safe_control/VLTSafe_rl_safe_transformer/cfg/envs/mujoco_envs.yaml')
+
+    env_name = "slide_pickup_clutter_mujoco_multimodal_env-v0"
+    env = gym.make(env_name, device=0, cfg=env_cfg[env_name])
+
+    save_gif = True
+    num_episodes = 10
+    max_ep_len = 400
+    down_action = np.array([0.0,0,-0.3,0])
+    up_action = np.array([0.3,0,0.3,0])
+
+    for i in range(num_episodes):
+        print(f'episode:{i}')
+        xt_all, at_all, imgs = [], [], []
+        xt = env.reset()
+        xt_all.append(xt)
+        
+        done = False
+        ep_len = 0
+        action = down_action.copy()
+        while not (done or ep_len == max_ep_len):
+        # while not (ep_len == max_ep_len):
+            # at = env.action_space.sample()
+            at = env.get_action()
+            at_all.append(at)
+            xt, _, done, _ = env.step(at)
+
+            xt_all.append(xt)
+
+            env.renderer.update_scene(env.data, camera=env.front_cam_name)
+            img = env.renderer.render()
+            imgs.append(img)
+
+            env.renderer.update_scene(env.data, camera=env.side_cam_name) 
+            img = env.renderer.render()
+            
+            ep_len += 1
+        print(f'ep_len: {ep_len}')
+        if save_gif:
+            file_name = f'test_slide_pickup_6objsNew_{i}_goal_{env.target_set_name}_{env.failure_mode}_{env.colliding_obj_name}'
+            imageio.mimsave(out_folder+f'{file_name}.gif', imgs[::4], duration=100)
+            env.plot_trajectory(xt_all, np.stack(at_all,axis=0), os.path.join(out_folder, f'{file_name}.png'))

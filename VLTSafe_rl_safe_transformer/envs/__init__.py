@@ -1,0 +1,1 @@
+from .slide_pickup_clutter_mujoco_multimodal import SlidePickupClutterMujocoMultimodalEnv
